@@ -21,8 +21,10 @@
 
 - 修复下载撞大小上限时留下半成品: 路径改为写盘前登记, 异常清理才真正生效;
   新增 `Content-Length` 预检, 并把报错里的尺寸换成人类可读单位。
+- 音乐下载器支持流式音频: 音频地址是 m3u8/mpd 时交给 ffmpeg 合并成可播放的容器
+  (原先只会把几 KB 的播放列表当音频存下来, 记录还显示成功)。
 - 新增视频下载器: mp4/webm 直链走框架下载, m3u8/mpd 交给 ffmpeg 转封装;
-  落盘后按文件魔数纠正扩展名并校验 MP4 的 `moov` 索引, 不完整即删除并标记失败。
+  两者落盘后都按文件魔数纠正扩展名并做完整性校验, 不完整即删除并标记失败。
 
 ### v1.1.0
 
@@ -68,16 +70,54 @@
 
 ## [1.2.0] — 2026-10-05
 
-新增视频下载器(m3u8/mpd 交给 ffmpeg 合并), 并修掉"半成品文件残留"这个会造成假成功的问题。
+音频/视频的**流式地址(m3u8 / mpd)**现在交给 ffmpeg 合并, 不再把播放列表文本当成
+下载成功; 顺带修掉"下载撞大小上限时留下半成品"这个会造成假成功的问题。
 
-### 1. 下载撞大小上限时留下半成品(真实事故)
+### 1. 音乐下载器支持流式音频(m3u8 / mpd) —— 修静默的假成功
+
+`smartcrawler/plugins/builtin/music_downloader.py` 原先只有一条路径: 拿到 URL 就交给
+框架的 `download_many` 流式 GET 落盘。音乐站点(网易云这类)的音频地址越来越常是
+HLS(`m3u8`)或 `mpd` 分片 —— 于是下载下来的"音频"实际是几 KB 的**播放列表文本**,
+而记录里是成功。这类假成功比失败更糟: 失败会重试, 假成功不会。
+
+现在按地址分流:
+
+- **mp4 / m4a / mp3 直链** —— 照旧走 `download_many`(带 Referer 防盗链);
+- **m3u8 / mpd 流** —— 交给 ffmpeg `-c copy` 转封装, 不重编码; 找不到 ffmpeg 就
+  **明确跳过并告警**, 绝不产出假文件。
+
+新增配置项: `hls_enabled`(默认开)、`ffmpeg_path`(留空自动查找项目内
+`tools/ffmpeg` 与系统 PATH)、`ffmpeg_timeout_s`。
+
+落盘后统一把关(与视频下载器共用):
+
+- **扩展名按文件魔数判定**, 不按 URL 后缀 —— 否则 `/clip.php?id=1` 这类地址会把音频
+  存成 `.php`; 容器与扩展名不符时(实际是 MKV 却按 `.m4a` 落盘)一并判失败, 因为
+  播放器会照着扩展名解析;
+- **校验 MP4 的 `moov` 索引原子** —— 被截断的 mp4 文件头依然是合法的 `ftyp`,
+  只看前几字节会误判成功。MP4 容器在音频场景落 `.m4a`。
+
+不通过校验的文件会被**删除并标记失败**, 不会留在磁盘上冒充产物。
+合规提醒不变: 音频多受版权保护, 请仅在拥有授权的前提下使用。
+
+### 2. 新增视频下载器(新增能力)
+
+`smartcrawler/plugins/builtin/video_downloader.py`, 与音频同源、复用同一套流处理:
+mp4/webm 直链走框架下载, m3u8/mpd 交给 ffmpeg 转封装。默认关闭, 单文件上限默认
+2048 MB —— 这是截断点而不是护栏, 设太小会把长视频切成残片。
+
+流式处理与"落盘后把关"抽到 `_media_stream.py` 由两者共用(含 `-headers` /
+`-user_agent` 的注入: 它们是 http 协议的私有选项, 对 `file:` 输入不加, 否则 ffmpeg
+直接报 `Option headers not found`)。
+
+### 3. 下载撞大小上限时留下半成品(真实事故)
 
 `smartcrawler/plugins/builtin/_media.py` 的 `download_many` 有个顺序错误:
 异常路径的清理依赖 `record.path`, 而 `record.path` 是在**写盘成功之后**才赋值的。
 于是流式写入中途撞上 `max_file_size` 抛异常时, 清理分支看到 `path` 为空直接跳过,
 磁盘上就留下一个体积巨大、结构不完整、却"看起来下载过"的残片。
 
-真实事故: 512 MiB 的 mp4 残片, 大小恰好等于当时的 `max_file_size_mb: 512`,
+真实事故: 512 MiB 的残片(大小恰好等于当时的 `max_file_size_mb: 512`),
 `ffprobe` 报 `moov atom not found` —— 播不了, 但记录里是成功。
 
 三处改动:
@@ -89,28 +129,7 @@
 - 新增 `_human_size()`: 原实现把字节整除成 MB, 1 MiB 以下一律显示 `0MB`,
   让"到底差多少"完全看不出来。
 
-### 2. 新增视频下载器(新增能力)
-
-`smartcrawler/plugins/builtin/video_downloader.py`。框架原有的下载器只会
-"流式 GET 然后写盘", 遇到 m3u8 会把播放列表(几 KB 文本)当成功结果存下来 ——
-文件名看着像视频, 内容是文本, 属于静默的错误结果。现按来源分流:
-
-- **mp4 / webm 直链** —— 复用 `download_many`(带 Referer 防盗链);
-- **m3u8 / mpd 流** —— 交给 ffmpeg `-c copy` 转封装, 不重编码; 找不到 ffmpeg
-  就明确跳过并告警, 绝不产出假文件。
-
-落盘后的两重把关:
-
-- **扩展名按文件魔数判定**, 不按 URL 后缀 —— 否则 `/clip.php?id=1` 这类地址会把
-  视频存成 `.php`, 此后没人认得出来;
-- **校验 MP4 的 `moov` 索引原子** —— 被截断的 mp4 文件头依然是合法的 `ftyp`,
-  只看前几字节会误判成功; 不通过校验的文件会被删除并标记失败。
-
-`-headers` / `-user_agent` 是 http 协议的私有选项, 因此按协议区分注入, 对本地
-`file:` 输入不加(否则 ffmpeg 直接报 `Option headers not found`)。插件默认关闭,
-单文件上限默认 2048 MB —— 这是截断点而不是护栏, 设太小会把长视频切成残片。
-
-### 3. 文档
+### 4. 文档
 
 - 新增 `CONTRIBUTING.md`, 并补上"必须手动执行 `git config core.hooksPath .githooks`"
   这一步: Git 不会自动启用克隆下来的钩子, 不执行的话密钥扫描这道防线是关着的;
@@ -121,6 +140,10 @@
 
 ### 验收
 
+- 新增 `scripts/verify_audio_stream.py`(本次音频需求的主验收, 13 项): 直链 `.m4a`
+  照旧下载 / **m3u8 必须被合并成能通过魔数与 `moov` 校验的音频容器** /
+  产物里不允许出现 `.m3u8` 播放列表 / `hls_enabled=False` 时明确跳过且不产出假文件 /
+  直链与流式混在同一条记录里各走各的路。
 - 新增 `scripts/verify_media_truncation.py`: 本地靶站 + **不声明** Content-Length 的
   流式响应, 覆盖"不留残片 / 预检不建文件 / 未超限正常落盘 / 尺寸格式化"。
   刻意避开 Content-Length 是为了让"写了一半"的路径可测 ——
@@ -128,10 +151,11 @@
 - 新增 `scripts/verify_video_integrity.py`(5 个场景, 含"截断的 mp4 必须被拦下")与
   `scripts/selfcheck.py`(环境/依赖/插件/浏览器/ffmpeg 自检, `--e2e` 真造一个 HLS
   流让插件合并一遍), 两者都离线可跑。
-- 回归: `check_version` 通过(1.2.0)、`check_changelog` 106/106、
+- 回归: `check_version` 通过(1.2.0)、`check_changelog` 通过、
   `check_plugin_docs` 111/111、`check_no_secrets` 通过、
-  `verify_media_truncation` 15/15、`verify_video_integrity` 全部通过、
-  `selfcheck --e2e` 通过; 插件管理器可正常加载内置插件(含新增的 video-downloader)。
+  `verify_audio_stream` 13/13、`verify_media_truncation` 15/15、
+  `verify_video_integrity` 全部通过、`selfcheck --e2e` 通过;
+  插件管理器可正常加载内置插件(含新增的 video-downloader)。
 
 ## [1.1.0] — 2026-10-04
 
